@@ -6,7 +6,7 @@ Install in PowerShell:
     py -m pip install --upgrade streamlit yfinance pandas numpy streamlit-autorefresh websocket-client
 
 Run:
-    py -m streamlit run tao_quant_trader_v13.py
+    py -m streamlit run tao_quant_trader_v14_fixed.py
 
 The app creates/uses tao_paper_trading.db beside this script.
 If you already used V3 and keep the V3 database in the same folder,
@@ -220,6 +220,10 @@ def db_connect():
 def init_db():
     with db_connect() as con:
         con.execute("PRAGMA journal_mode=WAL")
+        # Serialize schema migrations across Streamlit sessions/processes.
+        # Without this lock, two sessions can both see a missing column and
+        # race to ALTER TABLE, causing "duplicate column name" on the second.
+        con.execute("BEGIN IMMEDIATE")
         con.execute("""
             CREATE TABLE IF NOT EXISTS portfolio (
                 id INTEGER PRIMARY KEY CHECK(id=1),
@@ -266,16 +270,38 @@ def init_db():
                 duration_minutes REAL
             )
         """)
-        # Backward-compatible additions for older paper-trade databases.
-        existing_cols = {row["name"] for row in con.execute("PRAGMA table_info(signal_trades)").fetchall()}
+        # Backward-compatible, race-safe additions for older paper-trade databases.
+        # Re-read the schema immediately before each ALTER. The IMMEDIATE
+        # transaction above prevents another app session from migrating at
+        # the same time; the exception guard also tolerates an already-added
+        # column if a previous run was interrupted or another tool changed it.
+        def ensure_column(table_name, column_name, column_type):
+            existing = {
+                row["name"].lower()
+                for row in con.execute(f"PRAGMA table_info({table_name})").fetchall()
+            }
+            if column_name.lower() in existing:
+                return
+            try:
+                con.execute(
+                    f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"
+                )
+            except sqlite3.OperationalError as exc:
+                refreshed = {
+                    row["name"].lower()
+                    for row in con.execute(f"PRAGMA table_info({table_name})").fetchall()
+                }
+                if column_name.lower() not in refreshed:
+                    raise
+                # Another migration path added the column; continue safely.
+
         for col_name, col_type in (
             ("signal_score", "INTEGER"),
             ("atr_at_entry", "REAL"),
             ("initial_risk_pct", "REAL"),
             ("initial_reward_risk", "REAL"),
         ):
-            if col_name not in existing_cols:
-                con.execute(f"ALTER TABLE signal_trades ADD COLUMN {col_name} {col_type}")
+            ensure_column("signal_trades", col_name, col_type)
 
         con.execute("""
             CREATE TABLE IF NOT EXISTS market_alerts (
@@ -290,10 +316,8 @@ def init_db():
                 signature TEXT NOT NULL UNIQUE
             )
         """)
-        alert_cols = {row["name"] for row in con.execute("PRAGMA table_info(market_alerts)").fetchall()}
         for col_name, col_type in (("paper_trade_status", "TEXT"), ("paper_trade_reason", "TEXT")):
-            if col_name not in alert_cols:
-                con.execute(f"ALTER TABLE market_alerts ADD COLUMN {col_name} {col_type}")
+            ensure_column("market_alerts", col_name, col_type)
         con.execute("""CREATE TABLE IF NOT EXISTS paper_entry_signatures (
             signature TEXT PRIMARY KEY,
             trade_id INTEGER NOT NULL,
@@ -2279,6 +2303,6 @@ st.error(
     "and do not establish future profitability."
 )
 st.caption(
-    f"TAO Quant Lab V6 · Local ledger: {DB_PATH.name} · "
+    f"TAO Quant Lab V14 · Local ledger: {DB_PATH.name} · "
     "Keep this script and database in the same folder to preserve your paper portfolio."
 )
